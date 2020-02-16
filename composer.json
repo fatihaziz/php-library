@@ -3,7 +3,8 @@
     "description": "Fatih custom php libraries that used for projects",
     "type": "library",
     "require": {
-        "phpmailer/phpmailer": "^6.1"
+        "phpmailer/phpmailer": "^6.1",
+        "guzzlehttp/guzzle": "^6.5"
     },
     "license": "GNU General Public License v3.0",
     "authors": [
