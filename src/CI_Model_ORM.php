@@ -55,7 +55,9 @@ trait SecureController{
             $token = $this->token_model->decode($this->token->access_token);
         else{
             $token = request()->getBearerToken();
-            $token = $this->token_model->decode($token);    
+            $token = $this->token_model->decode($token);
+            $this->token        = arr2Obj(['access_token'=>$token]);
+            $this->access_token = $token;
         }
         if(!empty($scope) && $token->info->scope == $scope)
             return true;
@@ -72,8 +74,43 @@ trait SecureController{
 trait CrudDB {
     protected $crudDB;
 
+    // QUERY SECTION
+
     /**
-     * Matching Database Fields with Data
+     * Handle ORM Exceptions
+     *
+     * @param string $e
+     * @param array $opts
+     * @return object
+     */
+    protected function errorHandling($e="",$opts=[]){
+        if($opts['debug'] === true)
+            throw $e;
+        
+        if(!empty($e->getMessage())){
+            $e['code'] = $e->getCode();
+            $e['message'] = $e->getMessage();
+        }
+        else {
+            $e  = $this->db->error();
+        }
+        $e  = arr2Obj($e);
+
+        // handle duplicate entry,
+        if($e->code == 1062){
+            $e->code    = 101062;
+            $e->message = strLimit($e->message,5);
+        }
+        
+        if($opts['name']){
+           $e->name     = $opts['name'];
+        }
+        
+        return arr2Obj(['error'=>$e]);
+    }
+
+    /**
+     * Matching input data with database fields, if not match, throw them out.
      *
      * @param [type] $data
      * @param array $field_filter
@@ -85,41 +122,68 @@ trait CrudDB {
             
             if(!is_array($data))
                 throw new Exception('data is not array');
-            $fields     = $this->filterFieldsDB(array_merge($filter,array_keys($data)));
+            $fields     = $this->filterFieldsDB(array_merge($filter,array_keys($data)),[],['escape'=>true]);
             
             $accepted_data=[];
             foreach($fields as $f){
-                if(!empty($data[$f]))
+                if(!empty($data[$f]) || is_numeric($data[$f]))
                     $accepted_data[$f] = $data[$f];
             }
+                        
             return $accepted_data;
         }catch(Exception $e){
             throw new Exception("CrudDB-Error[match]: ".$e);
         }
     }
 
-    private function filterFieldsDB($filters=[],$fields=[]){
+    /**
+     * Determining which allowed fields to show.
+     *
+     * @param array $filters
+     * @param array $fields
+     * @param array $opts
+     * @return array
+     */
+    private function filterFieldsDB($filters=[],$fields=[],$opts=[]){
         try{
             $table          = $this->crudDB->name;
+
             if(empty($fields))
                 $fields     = $this->db->list_fields($this->crudDB->name);
             if(empty($filters) && !empty($this->crudDB->$table->fields))
                 $filters        = $this->crudDB->$table->fields;
             else if(empty($filters))
                 $filters        = $fields;
-
+            
             $filter_field   = [];
-            $filter_field   = array_filter($fields,function($v,$k) use ($filters){
-                $v = trim($v," ");
-                $allow = false;
+            $filter_field   = array_map(function($v) use (&$filters,$opts){
+                $v      = trim($v," ");
+                $field  = $v;
+                
+                $allow          = false;
                 foreach($filters as $filter){
                     $filter = trim($filter," ");
+                    $escapefilter   = null;
+                    
+                    // escape db operators
+                    if($opts['escape']){
+                        $escapefilter   = $filter;
+                        $explode    = explode(" ",$filter);
+                        $filter     = $explode[0];
+                    }
+
                     if(strpos($filter,"!") !== false){
                         if(trim($filter,"!") != $v){
                             $allow = true;
+                            if(!empty($explode[1])){
+                                $field  = $escapefilter;
+                            }
                         }
                         else if($filter == $v){
                             $allow = true;
+                            if(!empty($explode[1])){
+                                $field  = $escapefilter;
+                            }
                         }
                         else
                         {
@@ -129,17 +193,29 @@ trait CrudDB {
                     }
                     else if($filter == $v){
                         $allow = true;
+                        if(!empty($explode[1])){
+                            $field  = $escapefilter;
+                        }
                     }
                 }
-                return $allow;
-            },ARRAY_FILTER_USE_BOTH);
             
-            return $filter_field;
+                if($allow === true)
+                    return $field;
+            },$fields);
+            $filter_field = array_filter($filter_field);
+            return array_values($filter_field);
         }catch(Exception $e){
             throw new Exception("CrudDB-Error[filter]: ".$e);
         }
     }
 
+    /**
+     * Set which fields/coloumn will selected in db
+     *
+     * @param array $fields
+     * @param array $opts
+     * @return array
+     */
     private function selectFieldsDB($fields=[],$opts=[]){
         try{
             $table  = $this->crudDB->name;
@@ -171,6 +247,13 @@ trait CrudDB {
         }
     }
 
+    /**
+     * Set from talbe
+     *
+     * @param string $table
+     * @param array $opts
+     * @return string
+     */
     private function tableNameDB($table="",$opts=[]){
         try{
             if(!empty($table)){
@@ -191,11 +274,23 @@ trait CrudDB {
         }
     }
 
+    /**
+     * Reset all previous set selected and table name to model default
+     *
+     * @return void
+     */
     private function resetNameDB(){
         $this->tableNameDB(null,true);
         $this->selectFieldsDB(null,true);
     }
 
+    /**
+     * Extend join query
+     *
+     * @param [type] $table
+     * @param array $keys
+     * @return object
+     */
     private function joinDB($table,array $keys){
         try{
             $selectMainDB   = $this->selectFieldsDB();
@@ -220,25 +315,28 @@ trait CrudDB {
         }
     }
 
+
+    // GET RESULT FROM QUERY SECTION
+
     /**
      * save data into db
      *
      * @param [type] $data
      * @return object
      */
-	private function saveDB($data,$opts){
+	private function saveDB($data,$opts=[]){
 		try{
             $data = $this->matchingDataDB($data);
 			if(!$this->db->insert($this->crudDB->name,$data))
-				throw new Exception(arr2Obj($this->db->error())->message);
+				throw new Exception();
 			$data['id'] = $this->db->insert_id();
-			return arr2Obj($data);
+			$this->resetNameDB();
+            return arr2Obj($data);
 		}
 		catch(Exception $e)
 		{
-            if($opts['debug'] === true)
-                throw $e;
-			return arr2Obj(['error'=>$e->getMessage()]);
+            $err    = $this->errorHandling($e,array_merge(['name'=>'db_create_fail'],$opts));
+			return $err;
 		}
 	}
 
@@ -260,28 +358,36 @@ trait CrudDB {
                 $where  = $this->matchingDataDB($where);
             $query  = $this->db->select(implode(", ",$select));
             if(!$get = $query->get_where($this->crudDB->name,$where))
-                throw new Exception(arr2Obj($this->db->error())->message);
+                throw new Exception();
             $this->resetNameDB();
 			return $get->result();
         }
 		catch(Exception $e)
 		{
-            if($opts['debug'] === true)
-                throw $e;
-			return arr2Obj(['error'=>$e->getMessage()]);
+            $err    = $this->errorHandling($e,array_merge(['name'=>'db_get_fail'],$opts));
+			return $err;
         }
     }
     
     private function joinGetDB($table,array $keys,$where=[],$opts=[]){
         try{
             $join_query     = $this->joinDB($table,$keys);
-            if(!$get = $join_query->get_where(null,$where))
-                throw new Exception(arr2Obj($this->db->error())->message);
+            
+            $where_filtered = $this->filterFieldsDB(array_keys((array)$where));
+            // reformat where clause
+            $where_format   = [];
+            foreach($where_filtered as $k=>$w){
+                $where_format[$this->crudDB->name.'.'.$w] = $where[$w];
+                unset($where[$w]);
+            }
+            $where_format   = array_merge($where,$where_format);
+            
+            if(!$get = $join_query->get_where(null,$where_format))
+                throw new Exception();
             return $get->result();
         }catch(Exception $e){
-            if($opts['debug'] === true)
-                throw $e;
-            return arr2Obj(['error'=>$e->getMessage()]);
+            $err    = $this->errorHandling($e,array_merge(['name'=>'db_get_join_fail'],$opts));
+			return $err;
         }
     }
 
@@ -295,48 +401,66 @@ trait CrudDB {
      */
 	private function delDB($id="",$where=[],$opts=[]){
 		try{
-            if(isset($id))
+            if(!empty($id))
                 $where['id'] = $id;
-            $this->db->where($where);
-            if($this->db->delete($this->crudDB->name))
-                throw new Exception(arr2Obj($this->db->error())->message);
+            $select = $this->selectFieldsDB();
+            
+            if(!empty($where))
+                $where  = $this->matchingDataDB($where);
+            $query  = $this->db->select(implode(", ",$select));
+            $query->where($where);
+            if($query->delete($this->crudDB->name) === false )
+                throw new Exception();
+            $this->resetNameDB();
+            return [];
 		}
 		catch(Exception $e)
 		{
-            if($opts['debug'] === true)
-                throw $e;
-			return arr2Obj(['error'=>$e->getMessage()]);
+            $err    = $this->errorHandling($e,array_merge(['name'=>'db_destroy_fail'],$opts));
+			return $err;
 		}
 	}
 
     /**
      * update data into db
      *
+     * *DONT RUN SELECTFIELD! UPDATE DONT NEED SELECT, USE INSTEAD WHERE!
+     * *TO FILTER, JUST RUN SELECTFIELD OUTSIDE UPDATEDB METHOD
+     * 
      * @param [type] $id
      * @param [type] $data
      * @return object
      */
 	private function updateDB($id,$data,$opts=[]){
 		try{
-            $this->db->where(['id'=>$id]);
+            if(!empty($id))
+                $where['id'] = $id;
             $data = $this->matchingDataDB($data);
-            if(!$this->db->update($this->crudDB->name,$data))
-                throw new Exception(arr2Obj($this->db->error())->message);
             
-            $data = $this->find_one($id,[],['debug'=>true]);
+            if(!empty($where))
+                $where  = $this->matchingDataDB($where);
+            $query      = $this->db->where($where);
+            
+            if(!$query->update($this->crudDB->name,$data))
+                throw new Exception();
+
+            $data = $this->get_one($id,[],['debug'=>true]);
+            $this->resetNameDB();
             return arr2Obj($data);
 		}
 		catch(Exception $e)
 		{
-            if($opts['debug'] === true)
-                throw $e;
-			return arr2Obj(['error'=>$e->getMessage()]);
+            $err    = $this->errorHandling($e,array_merge(['name'=>'db_update_fail'],$opts));
+			return $err;
 		}
     }
 
     /**
      * Multi Update DB
      *
+     * *DONT RUN SELECTFIELD! UPDATE DONT NEED SELECT, USE INSTEAD WHERE!
+     * *TO FILTER, JUST RUN SELECTFIELD OUTSIDE UPDATEDB METHOD
+     * 
      * @param array $where
      * @param array $data
      * @param array $opts
@@ -344,26 +468,29 @@ trait CrudDB {
      */
     private function batchUpdateDB(array $where,array $data,$opts=[]){
         try{
-            $data = $this->matchingDataDB($data);
-            $oldData = $this->find(null,$where,['debug'=>true]);
-            $newData = array_map(function($v) use ($data){
+            $data       = $this->matchingDataDB($data);
+            
+            if(!empty($where))
+                $where  = $this->matchingDataDB($where);            
+
+            $oldData    = $this->find(null,$where,['debug'=>true]);
+            $newData    = array_map(function($v) use ($data){
                 return array_merge((array)$v,(array)$data);
             },(array) $oldData);
-            
             if(!$this->db->update_batch($this->crudDB->name,$newData,'id'))
-                throw new Exception(arr2Obj($this->db->error())->message);
+                throw new Exception();
             $newData = $this->find(null,$where,['debug'=>true]);
+            $this->resetNameDB();
             return arr2Obj($newData);
 		}
 		catch(Exception $e)
 		{
-            if($opts['debug'] === true)
-                throw $e;
-			return arr2Obj(['error'=>$e->getMessage()]);
+            $err    = $this->errorHandling($e,array_merge(['name'=>'db_multi_update_fail'],$opts));
+			return $err;
 		}
     }
 
-    // SEPARATOR PROTECTED FUNCTION AND PUBLIC FUNCTION
+    // PUBLIC FUNCTION SECTION
     
     function select_fields($fields=[],$opts=[]){
         return $this->selectFieldsDB($fields,$opts);
@@ -402,8 +529,7 @@ trait CrudDB {
 		return arr2Obj($find[0]);
 	}
 
-    function get_one($id,$condition=[],$opts=[])
-    {
+    function get_one($id,$condition=[],$opts=[]){
         if(empty($id)){
             return null;
         }
@@ -459,8 +585,13 @@ trait CrudDB {
      */
     function destroy($id="",$search=[],$opts=[]){
         if(empty($id) && empty($search))
-            $destroy = arr2Obj(['error'=>'destroy fail']);
-        $destroy = $this->delDB($id,$search,$opts);
+            return arr2Obj(['error'=>'destroy fail']);
+        
+        $item       = $this->find_one($id,$search);
+        if(empty($item))
+            return arr2Obj(['error'=>['name'=>'not_found']]);
+        
+        $destroy    = $this->delDB($id,$search,$opts);
 		return arr2Obj($destroy);
     }
 
@@ -470,4 +601,23 @@ trait CrudDB {
             return arr2Obj($find);
 		return arr2Obj($find[0]);
     }
+}
+
+
+if(!function_exists('strLimit')){
+	/**
+	 * String limit
+	 *
+	 * @param string $text
+	 * @param int $limit
+	 * @return void
+	 */
+    function strLimit($text, $limit) {
+		if (str_word_count($text, 0) > $limit) {
+			$words = str_word_count($text, 2);
+			$pos = array_keys($words);
+			$text = substr($text, 0, $pos[$limit]) . '...';
+		}
+		return $text;
+	}
 }
